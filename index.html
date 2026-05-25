@@ -8,6 +8,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=Outfit:wght@300;400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <style>
 /* ============================================================
    THEME TOKENS
@@ -583,7 +584,13 @@ footer{display:flex;align-items:center;justify-content:space-between;gap:14px;
   </section>
 
   <footer>
-    <span class="foot-note" id="footNote">Saved locally · nothing leaves this device</span>
+    <div style="display:flex; flex-direction:column; gap:10px;">
+      <span class="foot-note" id="footNote">Saved locally · nothing leaves this device</span>
+      <div id="syncPanel" style="display:flex; align-items:center; gap:8px;">
+        <input type="text" id="syncIdInput" placeholder="Enter Sync ID" style="background:var(--bg); border:1px solid var(--line); color:var(--text); padding:6px 12px; border-radius:8px; font-size:0.8rem; height:32px;">
+        <button id="btnSync" class="btn-reset" style="height:32px; padding:0 12px; border-color:var(--accent); color:var(--accent);">Connect Cloud</button>
+      </div>
+    </div>
     <button class="btn-reset" id="btnReset">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 3-6.7M3 4v4h4"/></svg>
       Reset to defaults
@@ -909,16 +916,76 @@ $("btnAdd").addEventListener("click", addLog);
 $("logCount").addEventListener("keydown", e=>{ if(e.key==="Enter") addLog(); });
 
 /* =====================================================================
-   PASSWORD LOCK
-   ---------------------------------------------------------------------
-   Stores only a SHA-256 hash of the password. The plain password is
-   never written anywhere. NOTE: client-side gating is a casual deterrent
-   only — anyone with dev tools can read this source. Don't store secrets.
+   CLOUD SYNC (SUPABASE)
    ===================================================================== */
-const PASS_KEY    = "usmle_step1_passhash_v1";   // localStorage: the hash
-const UNLOCK_KEY  = "usmle_step1_unlocked_v1";   // sessionStorage: unlocked this session
-// Default password is "USMLE" (SHA-256 hash below). Seeded on first run so the
-// dashboard ships pre-protected. Change it by clearing storage + re-seeding.
+const SUPABASE_URL = "https://nnmaynbogrqrfrxesnko.supabase.co";
+const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5ubWF5bmJvZ3JxcmZyeGVzbmtvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk3MDAzNjQsImV4cCI6MjA5NTI3NjM2NH0.Mu_3yQf8BNQAcLvLmLjha3f8bIOTDwfZaisMyr04-WY";
+const SYNC_ID_KEY  = "usmle_step1_sync_id_v1";
+
+let supabaseClient = null;
+let syncId = localStorage.getItem(SYNC_ID_KEY);
+
+async function initSupabase() {
+  if (typeof supabase === 'undefined') return;
+  supabaseClient = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+  if (syncId) {
+    await loadFromCloud();
+  }
+}
+
+async function loadFromCloud() {
+  if (!supabaseClient || !syncId) return;
+  
+  const { data: records, error } = await supabaseClient
+    .from('user_data')
+    .select('data')
+    .eq('sync_id', syncId)
+    .single();
+
+  if (error) {
+    console.error("Cloud load error:", error);
+    if (error.code === 'PGRST116') { // Not found
+      await saveToCloud(); // Initialize cloud with local data
+    }
+    return;
+  }
+
+  if (records && records.data) {
+    state = records.data;
+    renderAll();
+    applyTheme();
+    toast("Synced from Cloud");
+  }
+}
+
+async function saveToCloud() {
+  if (!supabaseClient || !syncId) return;
+  
+  const { error } = await supabaseClient
+    .from('user_data')
+    .upsert({ 
+      sync_id: syncId, 
+      data: state,
+      updated_at: new Date().toISOString()
+    }, { onConflict: 'sync_id' });
+
+  if (error) console.error("Cloud save error:", error);
+}
+
+// Update the save function to be cloud-aware
+const oldSave = save;
+save = async function() {
+  oldSave();
+  if (supabaseClient && syncId) {
+    await saveToCloud();
+  }
+};
+
+/* =====================================================================
+   PASSWORD LOCK (Modified for Sync)
+   ===================================================================== */
+const PASS_KEY    = "usmle_step1_passhash_v1";
+const UNLOCK_KEY  = "usmle_step1_unlocked_v1";
 const DEFAULT_HASH = "4b0d49b50190d6e18128d15c26c94f81f2289836e2bda941a1ae5d5c85d2f7b9";
 let dashStarted = false;
 
@@ -937,7 +1004,9 @@ function startDashboard(){
   populateLogSubjects();
   setDefaultDate();
   renderAll();
+  initSupabase(); // Start cloud sync
 }
+
 function unlock(){
   try{ sessionStorage.setItem(UNLOCK_KEY,"1"); }catch(e){}
   $("lock").classList.add("hidden");
@@ -997,6 +1066,23 @@ async function handleLockSubmit(){
   }
 }
 function shakeInput(el){ el.classList.remove("err"); void el.offsetWidth; el.classList.add("err"); }
+
+$("btnSync").addEventListener("click", async () => {
+  const id = $("syncIdInput").value.trim();
+  if (!id) { toast("Enter a Sync ID"); return; }
+  syncId = id;
+  localStorage.setItem(SYNC_ID_KEY, syncId);
+  $("btnSync").textContent = "Connecting...";
+  await initSupabase();
+  $("btnSync").textContent = "Connected";
+  $("footNote").textContent = "Cloud Sync Active";
+});
+
+if (syncId) {
+  $("syncIdInput").value = syncId;
+  $("btnSync").textContent = "Connected";
+  $("footNote").textContent = "Cloud Sync Active";
+}
 
 $("lockBtn").addEventListener("click", handleLockSubmit);
 $("lockPass").addEventListener("keydown", e=>{ if(e.key==="Enter") handleLockSubmit(); });
